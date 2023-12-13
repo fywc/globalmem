@@ -4,17 +4,19 @@
 #include <linux/cdev.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/sched/signal.h>
 
-#define globalfifo_SIZE	0x1000
+#define GLOBALFIFO_SIZE	0x1000
 #define MEM_CLEAR 0x1
-#define globalfifo_MAJOR	230
+#define GLOBALFIFO_MAJOR	230
 
-static int globalfifo_major = globalfifo_MAJOR;
+static int globalfifo_major = GLOBALFIFO_MAJOR;
 module_param(globalfifo_major, int, S_IRUGO);
 
 struct globalfifo_dev {
 	struct cdev cdev;
-	unsigned char mem[globalfifo_SIZE];
+	unsigned int current_len;
+	unsigned char mem[GLOBALFIFO_SIZE];
 	struct mutex mutex;
 	wait_queue_head_t r_wait;
 	wait_queue_head_t w_wait;
@@ -40,7 +42,7 @@ static ssize_t globalfifo_ioctl(struct file *filp, unsigned int cmd,
 	switch(cmd) {
 		case MEM_CLEAR:
 			mutex_lock(&dev->mutex);
-			memset(dev->mem, 0, globalfifo_SIZE);
+			memset(dev->mem, 0, GLOBALFIFO_SIZE);
 			mutex_unlock(&dev->mutex);
 			pr_info("globalfifo is set to 0\n");
 			break;
@@ -58,24 +60,54 @@ static ssize_t globalfifo_read(struct file *filp, char __user *buf, size_t size,
 	unsigned int count = size;
 	int ret = 0;
 	struct globalfifo_dev *dev = filp->private_data;
+	DECLARE_WAITQUEUE(wait, current);
 
-	if (p >= globalfifo_SIZE) {
+	if (p >= GLOBALFIFO_SIZE) {
 		return 0;
 	}
-	if (count >= globalfifo_SIZE - p) {
-		count = globalfifo_SIZE - p;
+	if (count >= GLOBALFIFO_SIZE - p) {
+		count = GLOBALFIFO_SIZE - p;
 	}
 
 	mutex_lock(&dev->mutex);
+	add_wait_queue(&dev->r_wait, &wait);
+	while (dev->current_len == 0) {
+		if (filp->f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+			goto out;
+		}
+		__set_current_state(TASK_INTERRUPTIBLE);
+		mutex_unlock(&dev->mutex);
+
+		schedule();
+		if (signal_pending(current)) {
+			ret = -ERESTARTSYS;
+			goto out2;
+		}
+
+		mutex_lock(&dev->mutex);
+	}
+	if (count >= dev->current_len) 
+		count = dev->current_len;
+
 	if (!copy_to_user(buf, dev->mem + p, count)) {
-		*ppos += count;
+		memcpy(dev->mem, dev->mem + count, dev->current_len - count);
+		dev->current_len -= count;
+		pr_info("read %d bytes, current_len: %d\n", count, dev->current_len);
+		wake_up_interruptible(&dev->w_wait);
+
 		ret = count;
 
-		pr_info("read %u bytes from %lu\n", count, p);
 	} else {
-		return -EFAULT;
+		ret = -EFAULT;
+		goto out;
 	}
+
+out:
 	mutex_unlock(&dev->mutex);
+out2:
+	remove_wait_queue(&dev->r_wait, &wait);
+	set_current_state(TASK_RUNNING);
 
 	return ret;
 }
@@ -87,23 +119,53 @@ static ssize_t globalfifo_write(struct file *filp, const char __user * buf, size
 	unsigned int count = size;
 	int ret = 0;
 	struct globalfifo_dev *dev = filp->private_data;
+	DECLARE_WAITQUEUE(wait, current);
 
-	if (p >= globalfifo_SIZE)
+	if (p >= GLOBALFIFO_SIZE)
 		return 0;
-	if (count >= globalfifo_SIZE - p) {
-		count = globalfifo_SIZE - p;
+	if (count >= GLOBALFIFO_SIZE - p) {
+		count = GLOBALFIFO_SIZE - p;
 	}
 
 	mutex_lock(&dev->mutex);
+	add_wait_queue(&dev->w_wait, &wait);
+	while (dev->current_len == GLOBALFIFO_SIZE) {
+		if (filp->f_flags & O_NONBLOCK) {
+			ret = -EAGAIN;
+			goto out;
+		}
+		__set_current_state(TASK_INTERRUPTIBLE);
+
+		mutex_unlock(&dev->mutex);
+
+		schedule();
+		if (signal_pending(current)) {
+			ret = -ERESTARTSYS;
+			goto out2;
+		}
+		
+		mutex_lock(&dev->mutex);
+	}
+	if (count > GLOBALFIFO_SIZE - dev->current_len)
+		count = GLOBALFIFO_SIZE - dev->current_len;
+	
 	if (!copy_from_user(dev->mem + p, buf, count)) {
-		*ppos += count;
+		dev->current_len += count;
+		pr_info("write %d bytes, current_len: %d\n", count, dev->current_len);
+
+		wake_up_interruptible(&dev->r_wait);
 		ret = count;
 
-		pr_info("write %u bytes from %lu\n", count, p);
 	} else {
-		return -EFAULT;
+		ret = -EFAULT;
+		goto out;
 	}
+
+out:
 	mutex_unlock(&dev->mutex);
+out2:
+	remove_wait_queue(&dev->w_wait, &wait);
+	set_current_state(TASK_RUNNING);
 
 	return ret;
 }
@@ -117,7 +179,7 @@ static loff_t globalfifo_llseek(struct file *filp, loff_t offset, int orig)
 				ret = -EINVAL;
 				break;
 			}
-			if ((unsigned int) offset > globalfifo_SIZE) {
+			if ((unsigned int) offset > GLOBALFIFO_SIZE) {
 				ret = -EINVAL;
 				break;
 			}
@@ -125,7 +187,7 @@ static loff_t globalfifo_llseek(struct file *filp, loff_t offset, int orig)
 			ret = filp->f_pos;
 			break;
 		case 1:
-			if ((filp->f_pos + offset) > globalfifo_SIZE) {
+			if ((filp->f_pos + offset) > GLOBALFIFO_SIZE) {
 				ret = -EINVAL;
 				break;
 			}
