@@ -1,5 +1,5 @@
 ifneq ($(KERNELRELEASE),)
-	obj-m := globalmem.o
+	obj-m := globalfifo.o
 #	obj-m += remap_pfn_vmalloc.o
 #	obj-m += remap_pfn_alloc_pages.o
 else
